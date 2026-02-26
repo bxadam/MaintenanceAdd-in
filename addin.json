@@ -1,0 +1,19 @@
+{
+  "name": "Fleet Maintenance Module",
+  "supportEmail": "support@yourcompany.com",
+  "version": "1.0.0",
+  "defaultLanguage": "en",
+  "items": [
+    {
+      "page": "customPage",
+      "title": "Fleet Maintenance",
+      "noView": false,
+      "menuName": {
+        "en": "Fleet Maintenance"
+      },
+      "icon": "https://raw.githubusercontent.com/YOUR_USERNAME/geotab-maintenance-addin/main/assets/icon.svg",
+      "url": "https://raw.githubusercontent.com/YOUR_USERNAME/geotab-maintenance-addin/main/src/index.html"
+    }
+  ],
+  "isSigned": false
+}
