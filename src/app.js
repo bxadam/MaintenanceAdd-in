@@ -17,8 +17,9 @@ const app = (() => {
   // Multi-vehicle picker state (used while reminder modal is open)
   let _pickerSelected = [];
 
-  // Known vehicles for the picker (seeded; extended by Geotab API)
-  const KNOWN_VEHICLES = [
+  // Vehicle list — populated by Geotab API when running inside MyGeotab,
+  // falls back to demo vehicles when running standalone.
+  let KNOWN_VEHICLES = [
     { id: 'TRK-041', make: '2022 Ford F-250' },
     { id: 'VAN-012', make: '2021 Mercedes Sprinter' },
     { id: 'FLT-088', make: '2023 Chevy Silverado' },
@@ -27,6 +28,19 @@ const app = (() => {
     { id: 'TRK-099', make: '2023 Ram 1500' },
     { id: 'VAN-031', make: '2021 Ford Transit' },
   ];
+
+  // Called by geotab.js once real vehicles are loaded from the API
+  const setVehicles = (vehicles) => {
+    KNOWN_VEHICLES = vehicles.map(v => ({
+      id:   v.name,
+      make: [v.year, v.make].filter(Boolean).join(' ') || v.licensePlate || '',
+    }));
+    // Refresh the reminder modal picker if it's currently open
+    const picker = document.getElementById('vehiclePicker');
+    if (picker) _refreshPickerUI();
+    // Refresh stats so vehicle count updates
+    _renderReminderStats();
+  };
 
   // ── Init ───────────────────────────────────────────────────────────────────
 
@@ -794,6 +808,7 @@ const app = (() => {
 
   return {
     init, refreshAll, switchTab, toggleTheme,
+    setVehicles,
     filterReminders, filterRemindersByStatus, filterRemindersByVehicle,
     openReminderModal, saveReminder, deleteReminder,
     _selectTrigger, _taskSelectChanged,
