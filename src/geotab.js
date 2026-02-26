@@ -2,41 +2,29 @@
  * geotab.js
  * Geotab MyGeotab API integration layer.
  *
- * This file handles:
- *  - Connecting to the Geotab API via the addin `initialize` callback
- *  - Polling live odometer (StatusData) for all tracked vehicles
- *  - Detecting triggered reminders and surfacing notifications
- *  - Providing a mock/demo mode when running outside of MyGeotab
- *
- * HOW TO USE:
- *  1. Host this add-in via GitHub Pages (see README.md).
- *  2. Register addin.json in your MyGeotab database under
- *     Administration → System → System Settings → Add-ins.
- *  3. The `initialize(freshApi, state, callback)` function is called
- *     automatically by MyGeotab when the page loads.
+ * - Connects to the Geotab API via the addin initialize() callback
+ * - Loads all real vehicles (Devices) from your database
+ * - Polls live odometer (StatusData) every 30 seconds
+ * - Detects triggered reminders and surfaces notifications
+ * - Falls back to demo mode when running outside of MyGeotab
  */
 
 const GeotabIntegration = (() => {
 
-  // Geotab diagnostic ID for odometer (standard across most vehicles)
   const ODOMETER_DIAGNOSTIC_ID = 'DiagnosticOdometerAdjustmentId';
-
-  // Poll interval in milliseconds (30 seconds)
   const POLL_INTERVAL_MS = 30_000;
 
-  let _api = null;          // Geotab API object injected by MyGeotab
+  let _api = null;
   let _pollTimer = null;
-  let _vehicles = [];       // Cache of device objects from Geotab
-  let _demoMode = false;
+  let _vehicles = []; // { id, name, licensePlate, make, model, year }
 
-  // ── Public API ──────────────────────────────────────────────────────────────
+  // ── Public ──────────────────────────────────────────────────────────────────
 
   const init = async (api) => {
     _api = api;
 
     if (!_api) {
-      console.warn('GeotabIntegration: No API object provided — running in demo mode.');
-      _demoMode = true;
+      console.warn('GeotabIntegration: No API — running in demo mode.');
       _startDemoMode();
       return;
     }
@@ -56,78 +44,94 @@ const GeotabIntegration = (() => {
     if (_pollTimer) clearInterval(_pollTimer);
   };
 
-  // ── Private helpers ─────────────────────────────────────────────────────────
+  // Expose vehicle list so app.js picker can use real vehicles
+  const getVehicles = () => _vehicles;
 
-  /**
-   * Fetch all Devices (vehicles) from Geotab and cache them.
-   * We map Geotab device names to the vehicle IDs used in our reminders.
-   */
+  // ── Load Vehicles ────────────────────────────────────────────────────────────
+
   const _loadVehicles = async () => {
     const devices = await _api.call('Get', {
       typeName: 'Device',
-      resultsLimit: 500,
+      resultsLimit: 2000,
     });
 
-    _vehicles = devices.map(d => ({
-      id: d.id,
-      name: d.name,        // e.g. "TRK-041"
-      licensePlate: d.licensePlate,
-    }));
+    _vehicles = devices
+      .filter(d => d.id && d.name && d.name !== 'Unknown')
+      .map(d => ({
+        id:           d.name,           // use device name as our vehicle ID (e.g. "TRK-041")
+        geotabId:     d.id,             // internal Geotab GUID for API calls
+        name:         d.name,
+        licensePlate: d.licensePlate || '',
+        make:         d.vehicleIdentificationNumber ? _inferMake(d) : '',
+        year:         d.year || '',
+      }));
 
-    // Populate vehicle filter dropdown with real names
+    // Sort alphabetically by name
+    _vehicles.sort((a, b) => a.name.localeCompare(b.name));
+
+    // Push real vehicles into the app picker
+    if (window.app && typeof window.app.setVehicles === 'function') {
+      window.app.setVehicles(_vehicles);
+    }
+
+    // Populate the vehicle filter dropdown in the reminders table
     const select = document.getElementById('vehicleFilter');
     if (select) {
+      // Clear any existing options except "All Vehicles"
+      while (select.options.length > 1) select.remove(1);
       _vehicles.forEach(v => {
         const opt = document.createElement('option');
         opt.value = v.name;
-        opt.textContent = v.name;
+        opt.textContent = v.name + (v.licensePlate ? ` (${v.licensePlate})` : '');
         select.appendChild(opt);
       });
     }
+
+    console.log(`GeotabIntegration: Loaded ${_vehicles.length} vehicles.`);
   };
 
-  /**
-   * Poll odometer StatusData for all vehicles and update the DataStore.
-   * After updating, check if any reminders have been triggered.
-   */
+  // ── Odometer Polling ─────────────────────────────────────────────────────────
+
   const _pollOdometers = async () => {
     if (!_api || !_vehicles.length) return;
 
     try {
-      // Batch request: get latest odometer for all tracked vehicle IDs
-      const trackedVehicleNames = DataStore.getUniqueVehicles();
-      const trackedDevices = _vehicles.filter(v =>
-        trackedVehicleNames.includes(v.name)
-      );
+      const trackedNames = DataStore.getUniqueVehicles();
+      const trackedDevices = _vehicles.filter(v => trackedNames.includes(v.name));
+
+      if (!trackedDevices.length) {
+        _updateSyncLabel();
+        return;
+      }
 
       const promises = trackedDevices.map(device =>
         _api.call('Get', {
           typeName: 'StatusData',
           search: {
-            deviceSearch: { id: device.id },
+            deviceSearch: { id: device.geotabId },
             diagnosticSearch: { id: ODOMETER_DIAGNOSTIC_ID },
-            fromDate: new Date(Date.now() - 60 * 60 * 1000).toISOString(), // last 1hr
+            fromDate: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), // last 2hrs
           },
           resultsLimit: 1,
         }).then(results => ({
           vehicleName: device.name,
-          odometer: results.length ? Math.round(results[0].data * 0.000621371) : null, // metres → miles
-        }))
+          // Geotab returns odometer in metres — convert to miles
+          odometer: results.length ? Math.round(results[0].data * 0.000621371) : null,
+        })).catch(() => ({ vehicleName: device.name, odometer: null }))
       );
 
       const readings = await Promise.all(promises);
 
+      let anyChanged = false;
       readings.forEach(({ vehicleName, odometer }) => {
         if (odometer !== null) {
           const changed = DataStore.updateOdometer(vehicleName, odometer);
-          if (changed) {
-            // Re-render if the app is already initialised
-            if (window.app) window.app.refreshAll();
-          }
+          if (changed) anyChanged = true;
         }
       });
 
-      // Check for newly triggered reminders and show notifications
+      if (anyChanged && window.app) window.app.refreshAll();
+
       _checkForTriggeredReminders();
       _updateSyncLabel();
 
@@ -137,36 +141,31 @@ const GeotabIntegration = (() => {
     }
   };
 
-  /**
-   * Find any reminders that are overdue and haven't been notified yet,
-   * then surface them via the app notification system.
-   */
+  // ── Triggered Reminder Notifications ────────────────────────────────────────
+
   const _checkForTriggeredReminders = () => {
-    const reminders = DataStore.getReminders();
-    const triggered = reminders.filter(r => r.status === 'overdue' && !r.notified);
+    const triggered = DataStore.getReminders()
+      .filter(r => r.status === 'overdue' && !r.notified)
+      .sort((a, b) => ({ High: 0, Medium: 1, Low: 2 }[a.priority] - { High: 0, Medium: 1, Low: 2 }[b.priority]));
 
-    if (triggered.length > 0 && window.app) {
-      // Show the most urgent one first
-      triggered.sort((a, b) => {
-        const priorityOrder = { High: 0, Medium: 1, Low: 2 };
-        return priorityOrder[a.priority] - priorityOrder[b.priority];
-      });
-
+    if (triggered.length && window.app) {
       const r = triggered[0];
-      const over = r.current - r.target;
-      window.app.showNotification(r, over);
-
-      // Mark as notified so we don't re-show immediately
+      window.app.showNotification(r, r.current - r.target);
       DataStore.updateReminder(r.id, { notified: true });
     }
   };
 
+  // ── Helpers ──────────────────────────────────────────────────────────────────
+
+  const _inferMake = (device) => {
+    // Geotab doesn't always expose make directly — use comment/description if set
+    return device.comment || '';
+  };
+
   const _setSyncStatus = (connected) => {
     const el = document.getElementById('syncLabel');
-    const dot = document.querySelector('.sync-dot');
     const wrap = document.querySelector('.sync-status');
     if (!el) return;
-
     if (connected) {
       el.textContent = 'LIVE · Synced with Geotab';
       wrap && wrap.classList.remove('disconnected');
@@ -178,73 +177,62 @@ const GeotabIntegration = (() => {
 
   const _updateSyncLabel = () => {
     const el = document.getElementById('syncLabel');
-    if (el) el.textContent = `LIVE · Synced ${_timeAgo(new Date())}`;
-  };
-
-  const _timeAgo = (date) => {
-    const diff = Math.round((Date.now() - date.getTime()) / 1000);
-    if (diff < 5)  return 'just now';
-    if (diff < 60) return `${diff}s ago`;
-    return `${Math.round(diff / 60)}m ago`;
+    if (el) el.textContent = `LIVE · Synced just now`;
+    // Reset to time-ago after 30s
+    let secs = 0;
+    const t = setInterval(() => {
+      secs += 5;
+      if (!el) { clearInterval(t); return; }
+      if (secs >= 30) { clearInterval(t); return; }
+      el.textContent = `LIVE · Synced ${secs}s ago`;
+    }, 5000);
   };
 
   // ── Demo Mode ────────────────────────────────────────────────────────────────
 
-  /**
-   * Demo mode simulates Geotab odometer data without a real API connection.
-   * The 🔔 bell button in the header triggers a simulated notification.
-   */
   const _startDemoMode = () => {
-    _setSyncStatus(true);
     const el = document.getElementById('syncLabel');
     if (el) el.textContent = 'DEMO · Click 🔔 to simulate trigger';
 
-    // Wire up the bell to simulate a triggered reminder
     const bell = document.getElementById('notifBell');
     if (bell) {
       bell.title = 'Click to simulate a triggered odometer reminder';
       bell.addEventListener('click', () => {
         const overdue = DataStore.getReminders().find(r => r.status === 'overdue');
         if (overdue && window.app) {
-          const over = overdue.current - overdue.target;
-          window.app.showNotification(overdue, over);
+          window.app.showNotification(overdue, overdue.current - overdue.target);
         }
       });
     }
 
-    // Show the badge as a hint
     const dot = document.getElementById('notifDot');
     if (dot) dot.style.display = 'block';
   };
 
-  return { init, destroy };
+  return { init, destroy, getVehicles };
 
 })();
 
 // ── Geotab Add-in Entry Point ─────────────────────────────────────────────────
 //
-// MyGeotab calls initialize() when the add-in page loads inside the iframe.
-// If we're running standalone (GitHub Pages preview / dev), api will be null
-// and we fall back to demo mode automatically.
+// MyGeotab automatically calls initialize(api, state, callback) when the
+// add-in iframe loads. This is the official Geotab add-in contract.
 
 var initialize = function (freshApi, state, callback) {
-  // Initialize data store first
   DataStore.init();
-
-  // Initialize UI
   if (window.app) window.app.init();
-
-  // Connect to Geotab (or demo mode)
   GeotabIntegration.init(freshApi || null);
-
   if (typeof callback === 'function') callback();
 };
 
-// Auto-start when loaded outside of MyGeotab (standalone / GitHub Pages)
+// ── Standalone / GitHub Pages fallback ───────────────────────────────────────
+// When opened directly in a browser (not inside MyGeotab), geotab is undefined
+// so we boot in demo mode automatically.
+
 if (typeof geotab === 'undefined') {
   document.addEventListener('DOMContentLoaded', () => {
     DataStore.init();
     if (window.app) window.app.init();
-    GeotabIntegration.init(null); // null → demo mode
+    GeotabIntegration.init(null);
   });
 }
