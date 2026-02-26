@@ -11,8 +11,8 @@
       "menuName": {
         "en": "Fleet Maintenance"
       },
-      "icon": "https://bxadam.github.io/geotab-maintenance-addin/assets/icon.svg",
-      "url": "https://bxadam.github.io/geotab-maintenance-addin/index.html"
+      "icon": "https://bxadam.github.io/MaintenanceAdd-in/assets/icon.svg",
+      "url": "https://bxadam.github.io/MaintenanceAdd-in/index.html"
     }
   ],
   "isSigned": false
